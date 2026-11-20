@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">微信登录选择</string>
+    <string name="xposed_description">第三方 App 调起微信登录/分享时，选择使用主空间还是双开空间的微信。作用域：系统框架。</string>
+
+    <string-array name="xposed_scope">
+        <item>android</item>
+    </string-array>
+
+    <style name="Transparent" parent="@android:style/Theme.DeviceDefault.DayNight">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>
