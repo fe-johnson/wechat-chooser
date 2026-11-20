@@ -82,50 +82,59 @@ public class Hook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"android".equals(lpparam.packageName)) return;
         try {
-            Class<?> atms = XposedHelpers.findClass(
-                    "com.android.server.wm.ActivityTaskManagerService", lpparam.classLoader);
-            int n = XposedBridge.hookAllMethods(atms, "startActivity", new XC_MethodHook() {
+            // Every activity start (startActivity, PendingIntent.send, am start, ...) ends up in
+            // ActivityStarter.execute(); newer WeChat OpenSDKs launch WeChat via a PendingIntent.
+            Class<?> starter = XposedHelpers.findClass(
+                    "com.android.server.wm.ActivityStarter", lpparam.classLoader);
+            int n = XposedBridge.hookAllMethods(starter, "execute", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
+                    if (IN_SELF_START.get()) return;
                     try {
-                        onStartActivity(param);
+                        onExecute(param);
                     } catch (Throwable t) {
                         XposedBridge.log(TAG + "hook error: " + t);
                     }
                 }
             }).size();
-            XposedBridge.log(TAG + "hooked ActivityTaskManagerService.startActivity x" + n);
+            XposedBridge.log(TAG + "hooked ActivityStarter.execute x" + n);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "init failed: " + t);
         }
     }
 
-    private static void onStartActivity(XC_MethodHook.MethodHookParam param) {
-        Object[] args = param.args;
-        Intent intent = null;
-        String callingPkg = null;
-        for (Object a : args) {
-            if (a instanceof Intent) {
-                intent = (Intent) a;
-                break;
-            }
-            if (callingPkg == null && a instanceof String) callingPkg = (String) a;
-        }
+    /** Skip our own nested launches. */
+    private static final ThreadLocal<Boolean> IN_SELF_START = ThreadLocal.withInitial(() -> false);
+
+    private static void onExecute(XC_MethodHook.MethodHookParam param) {
+        Object request = XposedHelpers.getObjectField(param.thisObject, "mRequest");
+        Intent intent = (Intent) XposedHelpers.getObjectField(request, "intent");
         if (intent == null) return;
         ComponentName cn = intent.getComponent();
         if (cn == null) return;
 
-        int callingUid = Binder.getCallingUid();
+        String callingPkg = (String) XposedHelpers.getObjectField(request, "callingPackage");
+        int callingUid = (Integer) XposedHelpers.getObjectField(request, "callingUid");
+        if (callingUid < 0) callingUid = Binder.getCallingUid();
+        if (callingUid % PER_USER_RANGE == 1000) return; // system_server itself
         int callingUser = callingUid / PER_USER_RANGE;
-        Context ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mContext");
+
+        boolean wxRequest = WX.equals(cn.getPackageName())
+                && cn.getClassName().startsWith(WX_STUB_PREFIX);
+        boolean fromSelf = SELF.equals(callingPkg);
+        boolean maybeCallback = WX.equals(callingPkg) && SESSIONS.containsKey(cn.getPackageName());
+        if (!wxRequest && !maybeCallback) return;
+
+        Object atms = XposedHelpers.getObjectField(param.thisObject, "mService");
+        Context ctx = (Context) XposedHelpers.getObjectField(atms, "mContext");
         cleanup();
 
         // 1) The user picked a WeChat in our chooser.
-        if (SELF.equals(callingPkg) && isSelfUid(ctx, callingUid)) {
+        if (fromSelf && isSelfUid(ctx, callingUid)) {
             String token = intent.getStringExtra(EX_TOKEN);
             if (token == null) return;
             Pending p = PENDING.remove(token);
-            param.setResult(START_SUCCESS);
+            intercept(param);
             if (p == null) {
                 XposedBridge.log(TAG + "unknown or expired token");
                 return;
@@ -136,8 +145,7 @@ public class Hook implements IXposedHookLoadPackage {
         }
 
         // 2) An app asks WeChat to log in / share / pay.
-        if (WX.equals(cn.getPackageName()) && cn.getClassName().startsWith(WX_STUB_PREFIX)
-                && !WX.equals(callingPkg) && !SELF.equals(callingPkg)) {
+        if (wxRequest && !WX.equals(callingPkg) && !fromSelf) {
             List<Integer> others = otherWxUsers(ctx, callingUser);
             if (others.isEmpty()) return;
 
@@ -167,7 +175,7 @@ public class Hook implements IXposedHookLoadPackage {
                     .putExtra(EX_APP, appLabel(ctx, appPkg, callingUser))
                     .putExtra(EX_COMPONENT, cn.flattenToString());
             if (startAsUser(ctx, chooser, callingUser)) {
-                param.setResult(START_SUCCESS);
+                intercept(param);
                 XposedBridge.log(TAG + "chooser shown for " + appPkg + " (user " + callingUser + ")");
             } else {
                 PENDING.remove(token);
@@ -177,11 +185,11 @@ public class Hook implements IXposedHookLoadPackage {
 
         // 3) WeChat in another profile calls back the app: route it to the app's own profile.
         Session s = SESSIONS.get(cn.getPackageName());
-        if (s != null && WX.equals(callingPkg) && callingUser == s.wxUser
+        if (s != null && maybeCallback && callingUser == s.wxUser
                 && callingUser != s.homeUser) {
             Intent back = new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             if (startAsUser(ctx, back, s.homeUser)) {
-                param.setResult(START_SUCCESS);
+                intercept(param);
                 XposedBridge.log(TAG + "callback " + cn.flattenToShortString()
                         + " routed user " + callingUser + " -> " + s.homeUser);
             }
@@ -202,8 +210,18 @@ public class Hook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + "request from " + appPkg + " -> WeChat user " + target + (ok ? "" : " FAILED"));
     }
 
+    /** Skip the original start and recycle the starter like execute() would. */
+    private static void intercept(XC_MethodHook.MethodHookParam param) {
+        param.setResult(START_SUCCESS);
+        try {
+            XposedHelpers.callMethod(param.thisObject, "onExecutionComplete");
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static boolean startAsUser(Context ctx, Intent intent, int userId) {
         long id = Binder.clearCallingIdentity();
+        IN_SELF_START.set(true);
         try {
             XposedHelpers.callMethod(ctx, "startActivityAsUser", intent, userHandle(userId));
             return true;
@@ -211,6 +229,7 @@ public class Hook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "startActivityAsUser(" + userId + ") failed: " + t);
             return false;
         } finally {
+            IN_SELF_START.set(false);
             Binder.restoreCallingIdentity(id);
         }
     }
