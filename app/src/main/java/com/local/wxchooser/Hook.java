@@ -205,7 +205,7 @@ public class Hook implements IXposedHookLoadPackage {
     private static boolean startAsUser(Context ctx, Intent intent, int userId) {
         long id = Binder.clearCallingIdentity();
         try {
-            XposedHelpers.callMethod(ctx, "startActivityAsUser", intent, UserHandle.of(userId));
+            XposedHelpers.callMethod(ctx, "startActivityAsUser", intent, userHandle(userId));
             return true;
         } catch (Throwable t) {
             XposedBridge.log(TAG + "startActivityAsUser(" + userId + ") failed: " + t);
@@ -243,7 +243,7 @@ public class Hook implements IXposedHookLoadPackage {
             int[] ids = (int[]) XposedHelpers.callMethod(um, "getProfileIds", callingUser, true);
             for (int u : ids) {
                 if (u == callingUser) continue;
-                if (um.isQuietModeEnabled(UserHandle.of(u))) continue;
+                if (um.isQuietModeEnabled(userHandle(u))) continue;
                 if (isInstalled(userContext(ctx, u).getPackageManager(), WX)) result.add(u);
             }
         } catch (Throwable t) {
@@ -283,8 +283,12 @@ public class Hook implements IXposedHookLoadPackage {
         }
     }
 
+    private static UserHandle userHandle(int userId) {
+        return UserHandle.getUserHandleForUid(userId * PER_USER_RANGE);
+    }
+
     private static Context userContext(Context ctx, int userId) {
-        return (Context) XposedHelpers.callMethod(ctx, "createContextAsUser", UserHandle.of(userId), 0);
+        return (Context) XposedHelpers.callMethod(ctx, "createContextAsUser", userHandle(userId), 0);
     }
 
     private static boolean isInstalled(PackageManager pm, String pkg) {
